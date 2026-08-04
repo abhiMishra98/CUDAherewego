@@ -42,3 +42,18 @@ accumulating locally, it does one atomic merge per bin into the global
 `histo` array. This is why the kernel synchronizes twice: once after zeroing
 the shared buffer, and once after all threads finish accumulating into it,
 before the final merge.
+
+## Register-level privatization
+
+Block-level privatization still leaves every thread in a block contending
+for the same 7 addresses in shared memory — with 256 threads per block, that's
+still frequent collisions on `atomicAdd(&d_histoBuff[bin], ...)`. Register
+privatization adds one more level underneath: each thread keeps its own
+`reg_histoBuff[7]` in registers and, while walking its grid-stride loop,
+increments its private copy with a plain `reg_histoBuff[bin]++` — no atomics,
+no contention, since no other thread can see or touch another thread's
+registers. Only after the loop finishes does each thread merge its 7
+private counts into the shared block histogram, via one `atomicAdd` per
+non-zero bin. This turns atomic traffic from "one atomic per byte processed"
+into "at most 7 atomics per thread, total," regardless of how much of the
+buffer that thread walked.

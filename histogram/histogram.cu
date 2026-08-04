@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstring>
 
-#define CUDA_CHECK(call)                                                      \
+#define CUDA_CHECK(call)                                                     \
     do                                                                       \
     {                                                                        \
         cudaError_t err = (call);                                            \
@@ -18,6 +18,8 @@
 __global__ void histo_kernel(unsigned char *buffer, long size, int *histo)
 {
     __shared__ int d_histoBuff[7]; // For privatisation, SMEM for each thread block
+    int reg_histoBuff[7] = {0};    // For privatisation, registers for each thread
+
     int tIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 
@@ -30,9 +32,15 @@ __global__ void histo_kernel(unsigned char *buffer, long size, int *histo)
         int alpha_pos = buffer[tIdx] - 'a';
         if (alpha_pos >= 0 && alpha_pos <= 25)
         {
-            atomicAdd(&(d_histoBuff[alpha_pos / 4]), 1);
+            reg_histoBuff[alpha_pos / 4]++;
         }
         tIdx += stride;
+    }
+
+    for (int i = 0; i < 7; ++i) // merge thread-private counts into the block's shared buffer
+    {
+        if (reg_histoBuff[i] > 0)
+            atomicAdd(&(d_histoBuff[i]), reg_histoBuff[i]);
     }
 
     __syncthreads();
