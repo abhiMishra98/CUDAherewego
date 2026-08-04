@@ -2,6 +2,7 @@
 #include <cuda/atomic>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #define CUDA_CHECK(call)                                                     \
     do                                                                       \
@@ -14,6 +15,22 @@
             exit(EXIT_FAILURE);                                              \
         }                                                                    \
     } while (0)
+
+__global__ void histo_kernel_naive(unsigned char *buffer, long size, int *histo)
+{
+    int tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    while (tIdx < size)
+    {
+        int alpha_pos = buffer[tIdx] - 'a';
+        if (alpha_pos >= 0 && alpha_pos <= 25)
+        {
+            atomicAdd(&(histo[alpha_pos / 4]), 1); // every hit contends directly on global memory
+        }
+        tIdx += stride;
+    }
+}
 
 __global__ void histo_kernel(unsigned char *buffer, long size, int *histo)
 {
@@ -53,25 +70,50 @@ __global__ void histo_kernel(unsigned char *buffer, long size, int *histo)
 
 int main()
 {
-    const char *testString = "the quick brown fox jumps over the lazy dog abcdefghijklmnopqrstuvwxyz";
-    long size = (long)strlen(testString);
+    FILE *file = fopen("input.txt", "rb");
+    if (!file)
+    {
+        fprintf(stderr, "Failed to open input.txt\n");
+        return EXIT_FAILURE;
+    }
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    unsigned char *h_buffer = (unsigned char *)malloc(size);
+    fread(h_buffer, 1, size, file);
+    fclose(file);
 
     unsigned char *d_buffer;
-    int *d_histo;
+    int *d_histo, *d_histo_naive;
     CUDA_CHECK(cudaMalloc(&d_buffer, size));
     CUDA_CHECK(cudaMalloc(&d_histo, 7 * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_buffer, testString, size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_histo_naive, 7 * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_buffer, h_buffer, size, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_histo, 0, 7 * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_histo_naive, 0, 7 * sizeof(int)));
+
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, device));
 
     dim3 blockDim(256);
-    dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
+
+    int numBlocksPerSm = 0; // max blocks/SM this exact kernel can keep resident, given its register/SMEM footprint
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, histo_kernel, blockDim.x, 0));
+    dim3 gridDim(deviceProp.multiProcessorCount * numBlocksPerSm); // fixed grid, sized to the GPU, not the input
+
+    histo_kernel_naive<<<gridDim, blockDim>>>(d_buffer, size, d_histo_naive);
+    CUDA_CHECK(cudaGetLastError());
 
     histo_kernel<<<gridDim, blockDim>>>(d_buffer, size, d_histo);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 
+    free(h_buffer);
     cudaFree(d_buffer);
     cudaFree(d_histo);
+    cudaFree(d_histo_naive);
 
     return 0;
 }

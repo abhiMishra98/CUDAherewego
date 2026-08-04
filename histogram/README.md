@@ -57,3 +57,59 @@ private counts into the shared block histogram, via one `atomicAdd` per
 non-zero bin. This turns atomic traffic from "one atomic per byte processed"
 into "at most 7 atomics per thread, total," regardless of how much of the
 buffer that thread walked.
+
+## Launch config: sizing the grid to the GPU, not the input
+
+The naive way to size a grid-stride kernel is
+`gridDim = (size + blockDim - 1) / blockDim` — just enough blocks to cover
+`size` elements in one pass. This is a trap for privatization: at large
+`size`, it produces roughly one thread per element, so the grid-stride
+`while` loop only ever runs once (or zero times) per thread. Register
+privatization's entire benefit comes from *amortizing many increments into
+one atomic merge* — with one element per thread, there's nothing to amortize,
+so the kernel pays privatization's fixed costs (shared-memory zeroing, two
+`__syncthreads()`, a 7-element merge loop per thread) for zero benefit. This
+was measured directly: on a 100MB input with a size-scaled grid, the naive
+kernel (6.02ms) *beat* the privatized one (9.58ms).
+
+The fix is to decouple grid size from input size entirely and size it off
+the GPU instead, so every thread strides across many elements regardless of
+how large the input gets:
+
+```cpp
+int numBlocksPerSm = 0;
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, histo_kernel, blockDim.x, 0);
+dim3 gridDim(deviceProp.multiProcessorCount * numBlocksPerSm);
+```
+
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` reports how many blocks of
+*this exact kernel* — given its actual register and shared-memory usage —
+can be simultaneously resident on one SM. Multiplying by the SM count gives
+a grid that keeps every SM fully occupied without over-launching. On the
+GTX 1650 used for this benchmark (14 SMs), that resolved to 4 blocks/SM →
+56 blocks total, launched regardless of whether the input is 10KB or 1GB.
+
+## Measured results (Nsight Systems)
+
+10MB test input on the launch config above (GTX 1650, 14 SMs):
+
+| Kernel | Total time | Notes |
+|---|---|---|
+| `histo_kernel_naive` (plain global `atomicAdd`, no privatization) | 6.05 ms | every hit contends on global memory directly |
+| `histo_kernel` (block + register privatization) | 2.09 ms | atomics only at the per-block merge step |
+
+**~2.9x faster** with privatization, once the grid is sized correctly. Both
+kernels were verified to produce identical bucket counts on the same input
+before comparing timing.
+
+Captured with:
+```powershell
+nsys profile --trace=cuda,nvtx,cublas,cuDNN --output=histogram_profile histogram.exe
+nsys stats --report cuda_gpu_kern_sum histogram_profile.nsys-rep
+```
+
+Deeper metrics (achieved occupancy, DRAM throughput, warp stall reasons via
+`ncu` or `nsys --gpu-metrics-devices`) aren't in this report — both require
+elevated GPU performance-counter access (`ERR_NVGPUCTRPERM`) that isn't
+available in a standard user session on Windows; that's a next step for
+whoever runs this from an administrator shell.
