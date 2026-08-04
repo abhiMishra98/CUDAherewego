@@ -108,12 +108,6 @@ nsys profile --trace=cuda,nvtx,cublas,cuDNN --output=histogram_profile histogram
 nsys stats --report cuda_gpu_kern_sum histogram_profile.nsys-rep
 ```
 
-Deeper metrics (achieved occupancy, DRAM throughput, warp stall reasons via
-`ncu` or `nsys --gpu-metrics-devices`) aren't in this report — both require
-elevated GPU performance-counter access (`ERR_NVGPUCTRPERM`) that isn't
-available in a standard user session on Windows; that's a next step for
-whoever runs this from an administrator shell.
-
 ![Nsight Systems timeline showing the H2D transfer fully blocking before either kernel starts](../images/histogram_V1_NsightSystems.jpg)
 
 Zooming into the transfer window shown above: under `CUDA HW`, the
