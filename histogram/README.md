@@ -113,3 +113,36 @@ Deeper metrics (achieved occupancy, DRAM throughput, warp stall reasons via
 elevated GPU performance-counter access (`ERR_NVGPUCTRPERM`) that isn't
 available in a standard user session on Windows; that's a next step for
 whoever runs this from an administrator shell.
+
+![Nsight Systems timeline showing the H2D transfer fully blocking before either kernel starts](../images/histogram_V1_NsightSystems.jpg)
+
+Zooming into the transfer window shown above: under `CUDA HW`, the
+`Memcpy HtoD (Pageable)` bar runs from ~391.5ms to ~394ms, and *both* kernel
+sub-rows (`histo_kernel_naive`, `histo_kernel`) are completely empty for that
+entire span — neither kernel starts until the transfer has fully finished.
+On the host side, `cudaMemcpy` blocks the CPU thread for the same duration,
+so nothing useful happens concurrently on either the GPU or the CPU during
+that ~2.5ms window.
+
+## Next optimization: overlapping transfer with compute (planned)
+
+The current version copies the entire input to the device with one
+synchronous, pageable `cudaMemcpy` before either kernel launches — the
+screenshot above is the direct evidence that transfer and compute never
+overlap. The planned fix:
+
+1. Allocate the host buffer with `cudaMallocHost` instead of `malloc` —
+   pinned (page-locked) memory is a hard requirement for `cudaMemcpyAsync`
+   to actually run asynchronously; on pageable memory it silently falls
+   back to synchronous behavior.
+2. Split the input into chunks and create one `cudaStream_t` per chunk.
+3. For each chunk, issue `cudaMemcpyAsync(..., stream[i])` followed by
+   `histo_kernel<<<..., stream[i]>>>(...)` on that same stream, all writing
+   into the same `d_histo` via `atomicAdd` — safe even with several chunks'
+   kernels running concurrently, since atomics are safe across streams, not
+   just across blocks within one kernel.
+
+Success criterion: in a re-profiled `CUDA HW` view, a chunk's
+`Memcpy HtoD` bar and a *different* chunk's kernel bar should overlap
+horizontally, instead of the kernel rows sitting empty under the transfer
+bar as they do above.

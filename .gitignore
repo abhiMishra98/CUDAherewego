@@ -1,0 +1,14 @@
+# Build artifacts
+*.exe
+*.exp
+*.lib
+*.pdb
+*.obj
+
+# Nsight Systems / Nsight Compute profiling output
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+
+# Generated test input
+histogram/input.txt
