@@ -84,31 +84,6 @@ int main()
     tile_matMul<<<gridDim, blockDim>>>(d_p, d_m, d_n, width);
     cudaError_t err = cudaGetLastError();
     cudaDeviceSynchronize();
-    cudaMemcpy(p, d_p, width * width * sizeof(float), cudaMemcpyDeviceToHost);
-
-    printf("M:\n");
-    for (int r = 0; r < width; ++r)
-    {
-        for (int c = 0; c < width; ++c)
-            printf("%6.1f ", m[r * width + c]);
-        printf("\n");
-    }
-
-    printf("N:\n");
-    for (int r = 0; r < width; ++r)
-    {
-        for (int c = 0; c < width; ++c)
-            printf("%6.1f ", n[r * width + c]);
-        printf("\n");
-    }
-
-    printf("P = M * N:\n");
-    for (int r = 0; r < width; ++r)
-    {
-        for (int c = 0; c < width; ++c)
-            printf("%6.1f ", p[r * width + c]);
-        printf("\n");
-    }
 
     free(m);
     free(n);
