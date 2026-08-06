@@ -19,6 +19,8 @@ Sharing my learnings on CUDA, profiling, benchmarking, and optimization of GPU k
   
   Profiled with Nsight Systems: privatization measured ~2.9x faster than the naive baseline once the grid was sized correctly. That same profiling also exposed the current bottleneck — the H2D transfer fully blocks before either kernel starts — laying the groundwork for the next planned optimization (overlapping transfer with compute via pinned memory and streams). Full writeup, numbers, and timeline screenshot in [histogram/README.md](histogram/README.md). Complete, runnable program.
 
+- **[Convolution/](Convolution/)** — 1D and 2D mask-centered convolution (`conv_1d`, `conv_2d`), one thread per output element/pixel, boundary-checked with implicit zero-padding. Both kernels currently read the input directly from global memory per mask tap (naive baseline); shared-memory tiling to cut the redundant reads is planned next. Kernel times measured against a CPU reference in [Convolution/README.md](Convolution/README.md). Not runnable yet — `main()` is a kernel-launch sketch with the block/grid dims set up but no allocated input; host-side setup is coming back with the shared-memory version.
+
 ## Compiling and running
 
 Requires the NVIDIA CUDA Toolkit (`nvcc`) and a CUDA-capable GPU.
@@ -40,7 +42,7 @@ nvcc tileMatMul.cu -o tileMatMul.exe
 .\tileMatMul.exe
 ```
 
-`clr_greyscale.cu` and `blurKernel.cu` will get the same treatment once their host-side code lands.
+`clr_greyscale.cu`, `blurKernel.cu`, and `Convolution/convolution.cu` will get the same treatment once their host-side code lands.
 
 `histogram.cu` lives in its own folder and needs an extra flag plus a test file, since it reads input at runtime rather than generating it:
 
