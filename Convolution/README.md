@@ -13,9 +13,13 @@ implicit — out-of-range mask taps are simply skipped rather than read.
   reads from there instead of global memory.
 - `conv_2d` — one thread per output pixel (2D grid), mask applied as a
   `maskW x maskW` square over both axes. Still reads `N` directly from
-  global memory per tap (redundancy is quadratic in `maskW` here); a
-  shared-memory version is planned next, following the same tiling approach
-  as `conv_1d_shared`.
+  global memory per tap (redundancy is quadratic in `maskW` here, worse than
+  `conv_1d`'s linear redundancy).
+- `conv_2d_shared` — same halo-tiling idea as `conv_1d_shared`, extended to
+  both axes, plus two more techniques layered on top: the mask lives in
+  `__constant__` memory instead of a pointer parameter, and `N`/`P` are
+  `cudaMallocPitch`-allocated instead of flat `width * height` blocks. See
+  below.
 
 ## `conv_1d_shared`: tiling with a halo
 
@@ -49,6 +53,69 @@ This is also why the block is launched with `blockDim.x = o_tile_width + maskW -
 matters independently — the last block's threads can still run past the end
 of `N` since `o_tile_width` doesn't evenly divide `width` in general.
 
+## `conv_2d_shared`: constant-memory mask + pitched allocation
+
+The tiling itself mirrors `conv_1d_shared` with a halo shift on both `row` and
+`col` instead of one axis (`index_i_row`/`index_i_col` each offset by
+`maskW / 2`, shared tile indexed `d_N[threadIdx.y][threadIdx.x]`, compute
+loop reading the unshifted `d_N[threadIdx.y + i][threadIdx.x + j]` window).
+Two more techniques are layered on top of that.
+
+**`__constant__` mask.** Instead of a `float *M` parameter, the mask lives in
+a file-scope `__constant__` array:
+
+```cpp
+#define MAX_MASK_WIDTH 5
+__constant__ float d_M[MAX_MASK_WIDTH * MAX_MASK_WIDTH];
+```
+
+Every thread in the compute loop reads `d_M[i * maskW + j]` at the same index
+on the same iteration, so the constant cache serves it as one broadcast to
+the whole warp rather than a separate global-memory load per thread — a
+strict improvement over `conv_2d`'s `M[i * maskW + j]`. The cost is that
+`MAX_MASK_WIDTH` is now a compile-time cap instead of a runtime size.
+
+**`cudaMemcpyToSymbol` to fill it.** The mask is copied in before launch:
+
+```cpp
+float h_M2ds[MAX_MASK_WIDTH * MAX_MASK_WIDTH] = {0};
+cudaMemcpyToSymbol(d_M, h_M2ds, maskW2ds * maskW2ds * sizeof(float));
+```
+
+Unlike `cudaMemcpy`, the destination is the `__constant__` symbol `d_M`
+itself, not a device pointer from `cudaMalloc` — `cudaMemcpyToSymbol`
+resolves `d_M`'s device address and copies directly into it. Nothing in the
+type system enforces this running before the kernel launch that reads
+`d_M`; only call order does.
+
+**`cudaMallocPitch` for `N` and `P`.** Rather than one flat
+`width * height` block where row `r` starts at `r * width`, each row is
+padded to a hardware-friendly alignment, and the real per-row byte stride is
+handed back through `pitchN`/`pitchP`:
+
+```cpp
+float *d_N2ds, *d_P2ds;
+size_t pitchN2ds, pitchP2ds;
+cudaMallocPitch(&d_N2ds, &pitchN2ds, width2ds * sizeof(float), height2ds);
+cudaMallocPitch(&d_P2ds, &pitchP2ds, width2ds * sizeof(float), height2ds);
+```
+
+The kernel has to index rows by that reported pitch, not the logical
+`width`, or it reads into row padding (or the next row) instead of the
+intended data:
+
+```cpp
+const float *N_row = (const float *)((const char *)N + index_i_row * pitchN);
+d_N[threadIdx.y][threadIdx.x] = N_row[index_i_col];
+...
+float *P_row = (float *)((char *)P + index_o_row * pitchP);
+P_row[index_o_col] = pVal;
+```
+
+The cast to `char *` before adding the pitch matters: `pitchN`/`pitchP` are
+byte offsets, so adding them directly to a `float *` would advance by that
+many `float`s (4x too far) instead of that many bytes.
+
 ## Measured results
 
 GPU kernel time only (`cudaEvent` around the kernel launch, excludes
@@ -66,11 +133,13 @@ predate `conv_1d_shared`, which doesn't have numbers yet — see below.
 
 `main()` is currently a kernel-launch sketch — it declares the block/grid
 dims and calls `conv_1d`, `conv_1d_shared`, and `conv_2d`, but the device
-pointers aren't allocated or filled with input, so it compiles (with
-uninitialized-variable warnings) but isn't meaningful to run yet. The host-side
-setup (allocation, random/CPU-reference input, timing) that was stripped out
-in favor of this skeleton needs to come back before `conv_1d_shared` can be
-verified or benchmarked against `conv_1d`.
+pointers aren't allocated or filled with input. 
+
+`conv_2d_shared` is the exception — it genuinely calls `cudaMallocPitch` and
+`cudaMemcpyToSymbol` (and `cudaFree`s what it allocates), since the whole
+point is demonstrating a real pitch value coming back from the allocator.
+Input data still isn't filled in, so it runs without meaningful results, but
+the allocation/mask-copy/launch/free sequence itself is real.
 
 ```powershell
 nvcc convolution.cu -o convolution.exe
@@ -78,12 +147,3 @@ nvcc convolution.cu -o convolution.exe
 
 If `nvcc` can't find `cl.exe`, run from a "Developer Command Prompt for VS"
 or add the MSVC `Hostx64\x64` bin directory to `PATH`.
-
-## Next
-
-- Host-side setup for `conv_1d_shared` (allocate, fill, run, verify against
-  the same CPU reference used for `conv_1d`, then compare kernel times) to
-  confirm the tiling actually beats the naive baseline above.
-- A shared-memory version of `conv_2d` (not yet written), following the same
-  tiling approach, where the payoff should be larger since the redundant
-  global reads are quadratic in `maskW` rather than linear.

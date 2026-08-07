@@ -3,6 +3,10 @@
 #include <cstring>
 #include <cstdlib>
 
+#define MAX_MASK_WIDTH 5
+
+__constant__ float d_M[MAX_MASK_WIDTH * MAX_MASK_WIDTH];
+
 __global__ void conv_1d(float *N, float *M, float *P, int maskW, int width)
 {
     int tdx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,6 +80,41 @@ __global__ void conv_2d(float *N, float *M, float *P, int maskW, int width, int 
     }
 }
 
+__global__ void conv_2d_shared(float *N, float *P, int maskW, int width, int height, int o_tile_width, size_t pitchN, size_t pitchP)
+{
+    __shared__ float d_N[32][32];
+    int index_o_col = blockIdx.x * o_tile_width + threadIdx.x;
+    int index_o_row = blockIdx.y * o_tile_width + threadIdx.y;
+    int index_i_col = index_o_col - (maskW / 2);
+    int index_i_row = index_o_row - (maskW / 2);
+
+    if (index_i_col >= 0 && index_i_col < width && index_i_row >= 0 && index_i_row < height)
+    {
+        const float *N_row = (const float *)((const char *)N + index_i_row * pitchN);
+        d_N[threadIdx.y][threadIdx.x] = N_row[index_i_col];
+    }
+    else
+    {
+        d_N[threadIdx.y][threadIdx.x] = 0.0f; // Especially for first block
+    }
+    __syncthreads();
+
+    if (threadIdx.x < o_tile_width && threadIdx.y < o_tile_width &&
+        index_o_col < width && index_o_row < height)
+    {
+        float pVal = 0.0f;
+        for (int i = 0; i < maskW; i++)
+        {
+            for (int j = 0; j < maskW; j++)
+            {
+                pVal += d_M[i * maskW + j] * d_N[threadIdx.y + i][threadIdx.x + j];
+            }
+        }
+        float *P_row = (float *)((char *)P + index_o_row * pitchP);
+        P_row[index_o_col] = pVal;
+    }
+}
+
 int main()
 {
     int width = 1024;
@@ -103,6 +142,26 @@ int main()
     dim3 blockDim1dShared(b_width1d);
     dim3 gridDim1dShared(((width - 1) / o_width1d + 1), 1, 1);
     conv_1d_shared<<<gridDim1dShared, blockDim1dShared>>>(d_N1d, d_M1d, d_P1d, maskW, width1d, o_width1d);
+
+    int width2ds = 1024;
+    int height2ds = 1024;
+    int maskW2ds = 5;
+    int o_tile_width2ds = 28; // blockDim = 28 + maskW - 1 = 32, the max block dim the 32x32 SMEM tile allows
+
+    float *d_N2ds, *d_P2ds;
+    size_t pitchN2ds, pitchP2ds;
+    cudaMallocPitch(&d_N2ds, &pitchN2ds, width2ds * sizeof(float), height2ds);
+    cudaMallocPitch(&d_P2ds, &pitchP2ds, width2ds * sizeof(float), height2ds);
+
+    float h_M2ds[MAX_MASK_WIDTH * MAX_MASK_WIDTH] = {0};
+    cudaMemcpyToSymbol(d_M, h_M2ds, maskW2ds * maskW2ds * sizeof(float));
+
+    dim3 blockDim2ds(o_tile_width2ds + maskW2ds - 1, o_tile_width2ds + maskW2ds - 1);
+    dim3 gridDim2ds((width2ds + o_tile_width2ds - 1) / o_tile_width2ds, (height2ds + o_tile_width2ds - 1) / o_tile_width2ds);
+    conv_2d_shared<<<gridDim2ds, blockDim2ds>>>(d_N2ds, d_P2ds, maskW2ds, width2ds, height2ds, o_tile_width2ds, pitchN2ds, pitchP2ds);
+
+    cudaFree(d_N2ds);
+    cudaFree(d_P2ds);
 
     return 0;
 }
