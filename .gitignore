@@ -4,6 +4,10 @@
 *.lib
 *.pdb
 *.obj
+Convolution/convolution
+
+# Packages
+*.deb
 
 # Nsight Systems / Nsight Compute profiling output
 *.nsys-rep

@@ -138,24 +138,47 @@ apples-to-apples naive-vs-tiled comparison, not two separately sized runs.
 It's a pure timing harness (real allocation, real random input,
 `cudaEvent`-timed launches) with no CPU-reference/correctness check —
 each kernel's output was verified against a CPU reference during
-development, but `main()` itself doesn't re-check it on every run. GPU
-kernel time only (excludes H2D/D2H transfer), GTX 1650:
+development, but `main()` itself doesn't re-check it on every run.
+
+`main()` calls `warmupGPU()` before any timed section — it launches each of
+the four kernels once, untimed, on tiny zeroed buffers first. Without it,
+whichever kernel launches first (`conv_1d`) absorbs one-time costs (CUDA
+context init, module load, GPU clocks ramping up from an idle power state)
+that have nothing to do with the kernel itself, inflating its time and
+making later kernels look artificially better by comparison. GPU kernel
+time only (excludes H2D/D2H transfer), GTX 1650, post-warmup:
 
 | Kernel | Input | Mask | Kernel time |
 |---|---|---|---|
-| `conv_1d` | 16,777,216 elements (1D) | 5 | ~2.0-2.4 ms |
-| `conv_1d_shared` | 16,777,216 elements (1D) | 5 | ~1.9 ms (1.1-1.3x) |
-| `conv_2d` | 4096 x 4096 elements (2D) | 5x5 | ~4.7-4.8 ms |
-| `conv_2d_shared` | 4096 x 4096 elements (2D) | 5x5 | ~4.1 ms (1.16x) |
+| `conv_1d` | 16,777,216 elements (1D) | 5 | ~0.98-1.0 ms |
+| `conv_1d_shared` | 16,777,216 elements (1D) | 5 | ~1.47-1.48 ms (0.66-0.67x — *slower*) |
+| `conv_2d` | 4096 x 4096 elements (2D) | 5x5 | ~3.79-3.81 ms |
+| `conv_2d_shared` | 4096 x 4096 elements (2D) | 5x5 | ~3.27-3.28 ms (1.16x) |
 
-The speedup from tiling is real but modest here, not the order-of-magnitude
-difference the "re-reads each element up to `maskW` times" framing at the
-top might suggest. `maskW = 5` doesn't leave much redundancy to remove
-(`conv_2d`'s worst case is 25 global reads per input element instead of 1,
-but the GTX 1650's L1/L2 caches already absorb a good chunk of that reuse
-even in the naive kernel), and the wall time in both cases is fairly close
-to launch/pipeline overhead. The tiling would likely pay off more visibly
-with a wider mask.
+Before `warmupGPU()` existed, `conv_1d` measured ~2.0-2.4 ms and
+`conv_1d_shared` looked ~1.1-1.3x faster — that gap was mostly the cold-clock
+penalty landing on `conv_1d` because it happened to launch first, not a real
+tiling advantage. With clocks already warm, `conv_1d_shared` is consistently
+*slower* than the naive kernel: `maskW = 5` doesn't leave much redundancy to
+remove in 1D (the GTX 1650's L1/L2 already absorbs most of that reuse even in
+the naive kernel), so the `__syncthreads()` + shared-memory staging overhead
+in `conv_1d_shared` costs more than it saves. `conv_2d_shared` still wins
+because 2D redundancy is quadratic in `maskW` (up to 25 global reads per
+input element vs. 1), which is enough to outweigh the same tiling overhead.
+The tiling would likely pay off more visibly in 1D too with a wider mask.
+
+## Profiling with Nsight Systems
+
+`nsys profile --trace=cuda,osrt --stats=true ./convolution` (GTX 1650) shows
+transfer time dwarfing compute: `cuda_gpu_mem_time_sum` totals ~151 ms of
+H2D+D2H copies across the run, versus ~12.3 ms of `cuda_gpu_kern_sum` kernel
+execution — transfers are ~12x the compute. Overlapping memcpy with compute
+(streams + pinned host memory) only hides the *smaller* of the two; whichever
+side is larger still sets the floor on total time. Here that's transfers, so
+the higher-leverage fix is shrinking/speeding up the copies themselves
+(pinned memory, fewer/larger transfers) rather than overlap alone — overlap
+becomes worth adding on top once compute is no longer trivially smaller than
+transfer.
 
 ## Compiling and running
 

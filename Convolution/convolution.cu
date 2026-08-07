@@ -115,9 +115,65 @@ __global__ void conv_2d_shared(float *N, float *P, int maskW, int width, int hei
     }
 }
 
+// Launches each kernel once
+void warmupGPU()
+{
+    const int w = 1024, h = 1024, mw = MAX_MASK_WIDTH;
+
+    float *d_N1, *d_M1, *d_P1;
+    cudaMalloc(&d_N1, w * sizeof(float));
+    cudaMalloc(&d_M1, mw * sizeof(float));
+    cudaMalloc(&d_P1, w * sizeof(float));
+    cudaMemset(d_N1, 0, w * sizeof(float));
+    cudaMemset(d_M1, 0, mw * sizeof(float));
+
+    dim3 block1d(256);
+    dim3 grid1d((w + block1d.x - 1) / block1d.x);
+    conv_1d<<<grid1d, block1d>>>(d_N1, d_M1, d_P1, mw, w);
+
+    dim3 block1ds(w);
+    dim3 grid1ds(1);
+    conv_1d_shared<<<grid1ds, block1ds>>>(d_N1, d_M1, d_P1, mw, w, w - (mw - 1));
+
+    float *d_N2, *d_M2, *d_P2;
+    cudaMalloc(&d_N2, (size_t)w * h * sizeof(float));
+    cudaMalloc(&d_M2, mw * mw * sizeof(float));
+    cudaMalloc(&d_P2, (size_t)w * h * sizeof(float));
+    cudaMemset(d_N2, 0, (size_t)w * h * sizeof(float));
+    cudaMemset(d_M2, 0, mw * mw * sizeof(float));
+
+    dim3 block2d(16, 16);
+    dim3 grid2d((w + block2d.x - 1) / block2d.x, (h + block2d.y - 1) / block2d.y);
+    conv_2d<<<grid2d, block2d>>>(d_N2, d_M2, d_P2, mw, w, h);
+
+    float *d_N2s, *d_P2s;
+    size_t pitchN2s, pitchP2s;
+    cudaMallocPitch(&d_N2s, &pitchN2s, w * sizeof(float), h);
+    cudaMallocPitch(&d_P2s, &pitchP2s, w * sizeof(float), h);
+    cudaMemset2D(d_N2s, pitchN2s, 0, w * sizeof(float), h);
+
+    int o_tile2d = 12; // matches block2ds = o_tile2d + mw - 1 = 16, a valid block dim
+    dim3 block2ds(o_tile2d + mw - 1, o_tile2d + mw - 1);
+    dim3 grid2ds((w + o_tile2d - 1) / o_tile2d, (h + o_tile2d - 1) / o_tile2d);
+    conv_2d_shared<<<grid2ds, block2ds>>>(d_N2s, d_P2s, mw, w, h, o_tile2d, pitchN2s, pitchP2s);
+
+    cudaDeviceSynchronize();
+
+    cudaFree(d_N1);
+    cudaFree(d_M1);
+    cudaFree(d_P1);
+    cudaFree(d_N2);
+    cudaFree(d_M2);
+    cudaFree(d_P2);
+    cudaFree(d_N2s);
+    cudaFree(d_P2s);
+}
+
 int main()
 {
     srand(42);
+
+    warmupGPU();
 
     // ==================== 1D: conv_1d vs conv_1d_shared ====================
     // Same width/mask/input for both, so the timings are a fair naive-vs-tiled
