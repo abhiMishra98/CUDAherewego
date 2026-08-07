@@ -180,6 +180,91 @@ the higher-leverage fix is shrinking/speeding up the copies themselves
 becomes worth adding on top once compute is no longer trivially smaller than
 transfer.
 
+![Nsight Systems timeline showing conv_2d and conv_2d_shared as thin kernel bars sandwiched between much wider memcpy blocks](../images/Conv_V1_NsightSystems.png)
+
+## Compute-bound or memory-bound?
+
+Convolution with a small mask is a classic memory-bound operation: each
+output element does only `maskW` (or `maskW x maskW` in 2D) multiply-adds,
+but touches roughly that many input elements from memory to do it — very
+little arithmetic per byte moved. The prediction, before profiling: all four
+kernels here should be memory-bound, not compute-bound.
+
+**Nsight Compute roofline, per kernel:**
+
+```bash
+sudo ncu --set full --section SpeedOfLight_RooflineChart \
+  --launch-skip 4 --launch-count 4 \
+  --export convolution_ncu_report ./convolution
+```
+
+(`--launch-skip 4` skips `warmupGPU()`'s 4 untimed launches, so the 4
+profiled ones are the real, timed kernels.) Open the result with
+`ncu-ui convolution_ncu_report.ncu-rep` (you may need
+`sudo chown $USER convolution_ncu_report.ncu-rep` first, since `ncu` ran as
+root), select each kernel launch, go to the **Details** page, expand
+**GPU Speed Of Light Throughput**, and switch its content-selector dropdown
+(top-right of that section) from "GPU Throughput Chart" to **"GPU Throughput
+Roofline"** — that's the FP32/FP64 chart matching `SpeedOfLight_RooflineChart`
+above (the Half/Single-hierarchical/Tensor Core options are separate sections
+this command didn't collect, and don't apply here anyway — none of these
+kernels use `__half` or tensor-core instructions).
+
+## Profiling with Nsight Compute
+
+| Kernel | Duration | % of FP32 peak | Achieved DRAM BW | % of peak BW (~192 GB/s) | `ncu`'s own verdict |
+|---|---|---|---|---|---|
+| `conv_1d` | 1.18 ms | 6% | 114.1 GB/s | ~60% | Latency issue |
+| `conv_1d_shared` | 1.80 ms | 4% | 74.3 GB/s | ~39% | Latency issue |
+| `conv_2d` | 4.71 ms | 7% | 28.5 GB/s | ~15% | Well-balanced (compute & memory both low) |
+| `conv_2d_shared` | 4.07 ms | 8% | 33.3 GB/s | ~17% | Latency issue |
+
+![conv_1d roofline: achieved point sits just under the memory-bandwidth diagonal, the closest of the four to its own roofline](../images/Conv_V1_1d_ncu.png)
+![conv_1d_shared roofline: achieved point sits further below the diagonal than conv_1d despite similar arithmetic intensity](../images/Conv_v1_1dShared_ncu.png)
+![conv_2d roofline: arithmetic intensity shifted right but the achieved point is far below the diagonal, the largest gap of the four](../images/Conv_v1_2d_ncu.png)
+![conv_2d_shared roofline: similar large gap below the diagonal as conv_2d, despite the tiling reducing global memory traffic](../images/Conv_v1_2dShared_ncu.png)
+
+**What the roofline model actually suggests here:** only `conv_1d` sits close
+to its own roofline (the achieved point is near the diagonal directly above
+its arithmetic intensity) — that one is honestly memory-bound and the
+"speed it up by moving less data" prediction holds. The other three,
+`conv_2d` in particular, are plotted well *below* their own diagonal despite
+`conv_2d`/`conv_2d_shared` having pushed arithmetic intensity further right
+than the 1D kernels (more reuse per byte from tiling/constant memory) — a
+falling dot at higher intensity with no better performance is the roofline
+chart's way of saying the bottleneck isn't bandwidth *or* compute, it's
+latency: not enough independent warps in flight to hide stalls, regardless
+of how much data movement was avoided.
+
+Two concrete, `ncu`-flagged causes point at exactly that, rather than at
+"do more math" (which is the usual roofline advice, but doesn't apply — none
+of these kernels are anywhere near the compute ceiling to begin with):
+
+- **Uncoalesced global memory access.** `SourceCounters` flags 12% excessive
+  sectors on `conv_1d`, 10% on `conv_1d_shared`, **24%** on `conv_2d`, 12% on
+  `conv_2d_shared` — `conv_2d`'s row-major `N[curRow * width + curCol]`
+  indexing with a 16x16 thread block is the worst offender, meaning nearly a
+  quarter of its memory transactions move bytes no thread actually needed.
+  This directly lowers the achieved point without changing arithmetic
+  intensity at all — fixing access patterns moves the dot straight up at
+  the same x.
+- **ALU-bound instruction mix, not FP32-bound.** `conv_1d`'s "Compute (SM)
+  Throughput" reads 55%, yet only 6% of that is the FP32 FMA pipe — ncu
+  separately flags "ALU is the highest-utilized pipeline (36.7%)". Most
+  issued instructions are address/index arithmetic and bounds-checking
+  (`ip_Start + i >= 0 && ... < width`, pitch-byte-offset casts, etc.), not
+  the convolution math itself. This is a second, independent way these
+  kernels fail to reach their roofline: the SM is busy, just not on the
+  work the chart is measuring.
+
+Net suggestion: for this workload, chasing arithmetic intensity (wider mask,
+more work per thread, fp16) is the wrong lever — none of the four kernels
+are pinned against the compute roof. The actual next steps are occupancy/
+coalescing fixes (reduce boundary-check branching, coalesce `conv_2d`'s
+access pattern, increase active warps per scheduler) to close the *vertical*
+gap to each kernel's own roofline, not a *horizontal* move to a higher
+arithmetic intensity.
+
 ## Compiling and running
 
 `main()` runs both pairs back to back and prints the table above.
