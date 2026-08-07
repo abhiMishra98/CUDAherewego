@@ -25,9 +25,8 @@ __global__ void conv_1d(float *N, float *M, float *P, int maskW, int width)
 __global__ void conv_1d_shared(float *N, float *M, float *P, int maskW, int width, int o_tile_width)
 {
     __shared__ float d_N[1024];
-
-    int index_i = blockIdx.x * o_tile_width + threadIdx.x;
-    int index_o = index_i + (maskW / 2);
+    int index_o = blockIdx.x * o_tile_width + threadIdx.x;
+    int index_i = index_o - (maskW / 2);
     if (index_i >= 0 && index_i < width)
     {
         d_N[threadIdx.x] = N[index_i];
@@ -38,7 +37,7 @@ __global__ void conv_1d_shared(float *N, float *M, float *P, int maskW, int widt
     }
     __syncthreads();
 
-    if (threadIdx.x < o_tile_width)
+    if (threadIdx.x < o_tile_width && index_o < width)
     {
         float pVal = 0.0f;
         for (int i = 0; i < maskW; i++)
