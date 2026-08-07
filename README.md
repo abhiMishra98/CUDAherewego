@@ -1,4 +1,4 @@
-# CUDAherewego
+# CUDA-Performance-Lab
 Sharing my learnings on CUDA, profiling, benchmarking, and optimization of GPU kernels
 
 ## Programs
