@@ -219,10 +219,25 @@ kernels use `__half` or tensor-core instructions).
 | `conv_2d` | 4.71 ms | 7% | 28.5 GB/s | ~15% | Well-balanced (compute & memory both low) |
 | `conv_2d_shared` | 4.07 ms | 8% | 33.3 GB/s | ~17% | Latency issue |
 
-![conv_1d roofline: achieved point sits just under the memory-bandwidth diagonal, the closest of the four to its own roofline](../images/Conv_V1_1d_ncu.png)
-![conv_1d_shared roofline: achieved point sits further below the diagonal than conv_1d despite similar arithmetic intensity](../images/Conv_v1_1dShared_ncu.png)
-![conv_2d roofline: arithmetic intensity shifted right but the achieved point is far below the diagonal, the largest gap of the four](../images/Conv_v1_2d_ncu.png)
-![conv_2d_shared roofline: similar large gap below the diagonal as conv_2d, despite the tiling reducing global memory traffic](../images/Conv_v1_2dShared_ncu.png)
+**`conv_1d`** — dot sits just under the memory-bandwidth diagonal, the
+closest of the four to its own roofline:
+
+![conv_1d roofline](../images/Conv_V1_1d_ncu.png)
+
+**`conv_1d_shared`** — dot sits further below the diagonal than `conv_1d`
+at a similar arithmetic intensity, despite doing less redundant global work:
+
+![conv_1d_shared roofline](../images/Conv_v1_1dShared_ncu.png)
+
+**`conv_2d`** — arithmetic intensity shifted well right of the 1D kernels,
+but the dot is the furthest below the diagonal of all four:
+
+![conv_2d roofline](../images/Conv_v1_2d_ncu.png)
+
+**`conv_2d_shared`** — similarly large gap below the diagonal as `conv_2d`,
+despite the tiling reducing global memory traffic further:
+
+![conv_2d_shared roofline](../images/Conv_v1_2dShared_ncu.png)
 
 **What the roofline model actually suggests here:** only `conv_1d` sits close
 to its own roofline (the achieved point is near the diagonal directly above
