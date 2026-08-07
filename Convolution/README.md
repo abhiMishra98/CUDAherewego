@@ -78,8 +78,9 @@ strict improvement over `conv_2d`'s `M[i * maskW + j]`. The cost is that
 **`cudaMemcpyToSymbol` to fill it.** The mask is copied in before launch:
 
 ```cpp
-float h_M2ds[MAX_MASK_WIDTH * MAX_MASK_WIDTH] = {0};
-cudaMemcpyToSymbol(d_M, h_M2ds, maskW2ds * maskW2ds * sizeof(float));
+float *h_M2d = (float *)malloc(maskW2d * maskW2d * sizeof(float));
+// ... filled with random values ...
+cudaMemcpyToSymbol(d_M, h_M2d, maskW2d * maskW2d * sizeof(float));
 ```
 
 Unlike `cudaMemcpy`, the destination is the `__constant__` symbol `d_M`
@@ -87,6 +88,19 @@ itself, not a device pointer from `cudaMalloc` — `cudaMemcpyToSymbol`
 resolves `d_M`'s device address and copies directly into it. Nothing in the
 type system enforces this running before the kernel launch that reads
 `d_M`; only call order does.
+
+This one bit while wiring it up: `main()` originally declared a local
+`float *d_M` for the (at the time) still-unfilled `conv_1d` call, which
+**shadowed the file-scope `__constant__ d_M` for the rest of `main()`**.
+`cudaMemcpyToSymbol(d_M, ...)` then silently resolved to that local
+(uninitialized) pointer instead of the constant symbol, failing with
+`invalid device symbol` and leaving the mask never copied — `conv_2d_shared`
+still ran and wrote *something*, just against whatever was already in
+constant memory, not the intended mask. Local names that collide with a
+`__constant__`/`__device__` symbol's name are worth avoiding for exactly
+this reason: nothing about the resulting call is ill-typed, it just
+silently binds to the wrong thing. (The 1D naive kernel's mask pointer is
+`d_M1d` today, well clear of any name collision.)
 
 **`cudaMallocPitch` for `N` and `P`.** Rather than one flat
 `width * height` block where row `r` starts at `r * width`, each row is
@@ -96,8 +110,8 @@ handed back through `pitchN`/`pitchP`:
 ```cpp
 float *d_N2ds, *d_P2ds;
 size_t pitchN2ds, pitchP2ds;
-cudaMallocPitch(&d_N2ds, &pitchN2ds, width2ds * sizeof(float), height2ds);
-cudaMallocPitch(&d_P2ds, &pitchP2ds, width2ds * sizeof(float), height2ds);
+cudaMallocPitch(&d_N2ds, &pitchN2ds, rowBytes2d, height2d);
+cudaMallocPitch(&d_P2ds, &pitchP2ds, rowBytes2d, height2d);
 ```
 
 The kernel has to index rows by that reported pitch, not the logical
@@ -116,30 +130,36 @@ The cast to `char *` before adding the pitch matters: `pitchN`/`pitchP` are
 byte offsets, so adding them directly to a `float *` would advance by that
 many `float`s (4x too far) instead of that many bytes.
 
-## Measured results
+## Measured results: naive vs. shared
 
-GPU kernel time only (`cudaEvent` around the kernel launch, excludes
-H2D/D2H transfer), GTX 1650:
+`main()` runs each pair — `conv_1d`/`conv_1d_shared`, `conv_2d`/`conv_2d_shared`
+— on the *same* random input, so the times below are a direct,
+apples-to-apples naive-vs-tiled comparison, not two separately sized runs.
+It's a pure timing harness (real allocation, real random input,
+`cudaEvent`-timed launches) with no CPU-reference/correctness check —
+each kernel's output was verified against a CPU reference during
+development, but `main()` itself doesn't re-check it on every run. GPU
+kernel time only (excludes H2D/D2H transfer), GTX 1650:
 
 | Kernel | Input | Mask | Kernel time |
 |---|---|---|---|
-| `conv_1d` | 16,777,216 elements (1D) | 5 | ~1.4 ms |
-| `conv_2d` | 4096 x 4096 elements (2D) | 5x5 | ~4.8 ms |
+| `conv_1d` | 16,777,216 elements (1D) | 5 | ~2.0-2.4 ms |
+| `conv_1d_shared` | 16,777,216 elements (1D) | 5 | ~1.9 ms (1.1-1.3x) |
+| `conv_2d` | 4096 x 4096 elements (2D) | 5x5 | ~4.7-4.8 ms |
+| `conv_2d_shared` | 4096 x 4096 elements (2D) | 5x5 | ~4.1 ms (1.16x) |
 
-Verified correct against a CPU reference implementation before timing. These
-predate `conv_1d_shared`, which doesn't have numbers yet — see below.
+The speedup from tiling is real but modest here, not the order-of-magnitude
+difference the "re-reads each element up to `maskW` times" framing at the
+top might suggest. `maskW = 5` doesn't leave much redundancy to remove
+(`conv_2d`'s worst case is 25 global reads per input element instead of 1,
+but the GTX 1650's L1/L2 caches already absorb a good chunk of that reuse
+even in the naive kernel), and the wall time in both cases is fairly close
+to launch/pipeline overhead. The tiling would likely pay off more visibly
+with a wider mask.
 
 ## Compiling and running
 
-`main()` is currently a kernel-launch sketch — it declares the block/grid
-dims and calls `conv_1d`, `conv_1d_shared`, and `conv_2d`, but the device
-pointers aren't allocated or filled with input. 
-
-`conv_2d_shared` is the exception — it genuinely calls `cudaMallocPitch` and
-`cudaMemcpyToSymbol` (and `cudaFree`s what it allocates), since the whole
-point is demonstrating a real pitch value coming back from the allocator.
-Input data still isn't filled in, so it runs without meaningful results, but
-the allocation/mask-copy/launch/free sequence itself is real.
+`main()` runs both pairs back to back and prints the table above.
 
 ```powershell
 nvcc convolution.cu -o convolution.exe
