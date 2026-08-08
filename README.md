@@ -1,6 +1,14 @@
 # CUDA-Performance-Lab
 Sharing my learnings on CUDA, profiling, benchmarking, and optimization of GPU kernels
 
+## Test environment
+
+All benchmarks and profiling numbers in this repo (including sub-folder
+READMEs) were measured on:
+
+- **GPU:** NVIDIA GeForce GTX 1650, 14 SMs
+- **Peak memory bandwidth:** ~192 GB/s
+
 ## Programs
 
 - **clr_greyscale.cu** — Converts an RGB image to grayscale. Each thread maps to one pixel, reading the 3-channel RGB value and writing a single grayscale value using the standard luminance weights (0.21R + 0.71G + 0.07B). Not runnable yet — `main()` is a kernel-launch sketch referencing undeclared variables (`n`, `m`, `w`, `h`, `d_Pin`, `d_Pout`); host-side setup is coming in a future commit.
